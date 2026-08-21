@@ -391,20 +391,18 @@ input[type=number]::-webkit-outer-spin-button{-webkit-appearance:none}
   </div>
 </div>
 
-<!-- SIGN IN OVERLAY -->
-<div id="signInOverlay" style="display:none;position:fixed;inset:0;background:rgba(8,12,18,.92);
+<!-- SIGN IN OVERLAY — visible by default; this whole app is admin-only -->
+<div id="signInOverlay" style="display:flex;position:fixed;inset:0;background:rgba(8,12,18,.92);
   z-index:300;align-items:center;justify-content:center;flex-direction:column;gap:20px">
   <div style="background:var(--bg2);border:1px solid var(--border2);border-radius:12px;
     padding:32px 40px;text-align:center;max-width:400px">
     <div style="font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;
       margin-bottom:6px"><span style="color:var(--accent)">SOC</span><span style="color:var(--text2)">::ROSTER</span></div>
     <p style="font-size:12px;color:var(--text2);margin-bottom:24px;line-height:1.6">
-      Sign in with your Google account to push<br>the generated roster to Google Sheets.
+      This tool is restricted to authorized admin accounts.<br>Sign in with Google to continue.
     </p>
     <div id="googleSignInBtn"></div>
-    <p style="font-size:10px;color:var(--text3);margin-top:16px">
-      You can still use the app offline — sign in only needed to push to Sheets.
-    </p>
+    <p id="signInMsg" style="font-size:11px;margin-top:16px;min-height:14px"></p>
   </div>
 </div>
 
@@ -3629,9 +3627,9 @@ function handleIdToken(response) {
     scope: 'https://www.googleapis.com/auth/userinfo.email',
     callback: (tokenResp) => {
       if (tokenResp.access_token) {
-        gAuthToken   = tokenResp.access_token;
-        gUserEmail   = payload.email;
-        showAuthBar(payload);
+        gAuthToken = tokenResp.access_token;
+        gUserEmail = payload.email;
+        verifyAdminAndUnlock(payload);
       }
     },
   });
@@ -3645,43 +3643,58 @@ function handleTokenResponse(resp) {
     headers: { Authorization: 'Bearer ' + gAuthToken }
   }).then(r => r.json()).then(info => {
     gUserEmail = info.email;
-    showAuthBar(info);
+    verifyAdminAndUnlock(info);
   });
 }
 
-function showAuthBar(userInfo) {
-  document.getElementById('signInOverlay').style.display = 'none';
-  document.getElementById('authBar').style.display = 'flex';
-  document.getElementById('authName').textContent  = userInfo.name || userInfo.email;
-  document.getElementById('authBadge').textContent = gIsAdmin ? 'Admin' : 'User';
-  document.getElementById('authBadge').className   = 'auth-badge ' + (gIsAdmin?'admin':'user');
-  document.getElementById('btnSignOut').style.display = '';
-  if (userInfo.picture) {
-    document.getElementById('authAvatar').src = userInfo.picture;
-    document.getElementById('authAvatar').style.display = '';
+// Gate: nothing in the app unlocks until this confirms the signed-in
+// account is genuinely an admin (Employee_Master col F), verified
+// server-side by the Worker — not just "did Google sign-in succeed".
+async function verifyAdminAndUnlock(userInfo) {
+  const msg = document.getElementById('signInMsg');
+  msg.style.color = 'var(--text2)';
+  msg.textContent = 'Checking access…';
+
+  if (!WORKER_URL) {
+    msg.style.color = 'var(--warn-t)';
+    msg.textContent = 'WORKER_URL not configured — cannot verify access.';
+    return;
   }
-  if (WORKER_URL) {
-    // Real admin check: listMonthTabs is admin-gated server-side in the
-    // Worker (checks Employee_Master col F). If it succeeds, this account
-    // is genuinely an admin — unlike the old getSyncFlag check, which
-    // returned ok:true for ANY signed-in user regardless of admin status.
-    fetch(WORKER_URL, {
+
+  let res;
+  try {
+    res = await fetch(WORKER_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: 'listMonthTabs', token: gAuthToken }),
-    }).then(r => r.json()).then(d => {
-      gIsAdmin = !!d.ok;
-      document.getElementById('authBadge').textContent = gIsAdmin ? 'Admin' : 'User';
-      document.getElementById('authBadge').className   = 'auth-badge ' + (gIsAdmin?'admin':'user');
-      if (gIsAdmin) {
-        document.getElementById('btnPush').style.display = '';
-        if (Object.keys(roster).length > 0) {
-          document.getElementById('btnPush').disabled = false;
-        }
-      } else {
-        setPushStatus('Signed in, but this account is not an admin on the roster Sheet.', 'err');
-      }
-    }).catch(() => {});
+    }).then(r => r.json());
+  } catch (e) {
+    msg.style.color = 'var(--warn-t)';
+    msg.textContent = 'Could not reach the server. Try again.';
+    return;
+  }
+
+  gIsAdmin = !!res.ok;
+  if (!gIsAdmin) {
+    gAuthToken = null; gUserEmail = null;
+    msg.style.color = 'var(--warn-t)';
+    msg.textContent = 'This Google account is not authorized for this tool.';
+    google.accounts.id.disableAutoSelect();
+    return;
+  }
+
+  // Unlock the app
+  document.getElementById('signInOverlay').style.display = 'none';
+  document.getElementById('authBar').style.display = 'flex';
+  document.getElementById('authName').textContent  = userInfo.name || userInfo.email;
+  document.getElementById('authBadge').textContent = 'Admin';
+  document.getElementById('authBadge').className   = 'auth-badge admin';
+  document.getElementById('btnSignOut').style.display = '';
+  document.getElementById('btnPush').style.display = '';
+  if (Object.keys(roster).length > 0) document.getElementById('btnPush').disabled = false;
+  if (userInfo.picture) {
+    document.getElementById('authAvatar').src = userInfo.picture;
+    document.getElementById('authAvatar').style.display = '';
   }
 }
 
@@ -3689,6 +3702,8 @@ function signOut() {
   gAuthToken = null; gUserEmail = null; gIsAdmin = false;
   document.getElementById('authBar').style.display = 'none';
   document.getElementById('btnPush').style.display = 'none';
+  document.getElementById('signInMsg').textContent = '';
+  document.getElementById('signInOverlay').style.display = 'flex'; // re-lock
   if (GOOGLE_CLIENT_ID) {
     google.accounts.id.disableAutoSelect();
   }
